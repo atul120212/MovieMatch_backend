@@ -38,6 +38,7 @@ class MemberOut(BaseModel):
     name: str
     voted_count: Optional[int] = None
     genres: Optional[List[str]] = None
+    notified: Optional[bool] = False
 
 
 class MovieCardOut(BaseModel):

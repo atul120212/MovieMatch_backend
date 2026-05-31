@@ -69,6 +69,7 @@ class User(Base):
     display_name = Column(String, nullable=False)
     avatar_url = Column(String, nullable=True)
     genre_prefs = Column(_JSON, nullable=True, default=dict)
+    notified = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # A user can host many sessions
@@ -195,8 +196,25 @@ class Match(Base):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def init_db() -> None:
-    """Create all tables (idempotent)."""
+    """Create all tables (idempotent) and run DDL migrations."""
     Base.metadata.create_all(bind=engine)
+    # Check if the column 'notified' exists in 'users' table, if not add it dynamically
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        # Check column existence
+        db.execute(text("SELECT notified FROM users LIMIT 1"))
+    except Exception:
+        db.rollback()
+        try:
+            db.execute(text("ALTER TABLE users ADD COLUMN notified BOOLEAN DEFAULT FALSE NOT NULL"))
+            db.commit()
+            print("Successfully added 'notified' column to 'users' table via auto-migration.")
+        except Exception as e:
+            print(f"Failed to add 'notified' column: {e}")
+            db.rollback()
+    finally:
+        db.close()
 
 
 def get_db():

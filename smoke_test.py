@@ -17,8 +17,21 @@ assert r.status_code == 200, r.text
 guest = r.json()
 guest_id = guest["user_id"]
 print(f"Guest joined: {guest['user_name']}  id={guest_id[:8]}")
+# 2b. Test notifications
+print("Testing host notify player endpoint...")
+r = httpx.post(f"{BASE}/api/users/{guest_id}/notify", timeout=TIMEOUT)
+assert r.status_code == 200, r.text
+assert r.json()["notified"] is True
 
-# 2b. Update user genres to shape recommendations
+# Verify notification flag in room details
+r = httpx.get(f"{BASE}/api/rooms/{code}", timeout=TIMEOUT)
+assert r.status_code == 200
+details = r.json()
+member_map = {m["id"]: m for m in details["members"]}
+assert member_map[guest_id]["notified"] is True, "Expected guest to be flagged as notified"
+print("Player successfully flagged as notified")
+
+# 2c. Update user genres to shape recommendations
 print("Updating user genre preferences...")
 r = httpx.put(f"{BASE}/api/users/{host_id}/genres", json={"genres": ["Romance", "Drama"]}, timeout=TIMEOUT)
 assert r.status_code == 200
@@ -26,7 +39,7 @@ r = httpx.put(f"{BASE}/api/users/{guest_id}/genres", json={"genres": ["Horror", 
 assert r.status_code == 200
 print("User genres updated successfully")
 
-# 3. Room details (lobby state) - verify genres are returned
+# 3. Room details (lobby state) - verify genres are returned and notified flag is cleared
 r = httpx.get(f"{BASE}/api/rooms/{code}", timeout=TIMEOUT)
 assert r.status_code == 200
 details = r.json()
@@ -35,7 +48,8 @@ member_map = {m["id"]: m for m in details["members"]}
 print(f"Room state={details['state']}  members={names}")
 assert "Romance" in member_map[host_id]["genres"], "Expected host to have Romance genre preference"
 assert "Horror" in member_map[guest_id]["genres"], "Expected guest to have Horror genre preference"
-print("Member preferences correctly returned in room details")
+assert member_map[guest_id]["notified"] is False, "Expected guest notified flag to be cleared after setting vibe"
+print("Member preferences and cleared notification state correctly returned in room details")
 
 # 4. Start swiping
 r = httpx.post(f"{BASE}/api/rooms/{code}/start", timeout=TIMEOUT)
