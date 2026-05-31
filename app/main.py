@@ -78,10 +78,15 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Define and mount static watch directory for streaming media
+watch_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "watch"))
+os.makedirs(watch_dir, exist_ok=True)
+app.mount("/watch", StaticFiles(directory=watch_dir), name="watch")
 
 
 @app.on_event("startup")
@@ -979,8 +984,8 @@ async def upload_movie(
     with open(temp_file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Next.js asset directory path (inside frontend/public/watch/{movie_id})
-    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "public", "watch", movie.id))
+    # Save transcoded files to the backend's own watch directory
+    output_dir = os.path.join(watch_dir, movie.id)
     
     # Run FFmpeg transcode as a background task
     background_tasks.add_task(transcode_movie, code_upper, movie.id, temp_file_path, output_dir)
@@ -1039,7 +1044,7 @@ def cleanup_expired_movies():
 
         for movie in expired_movies:
             print(f"Cleaning up expired movie: {movie.title} (ID: {movie.id})")
-            output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "public", "watch", movie.id))
+            output_dir = os.path.join(watch_dir, movie.id)
             if os.path.exists(output_dir):
                 try:
                     shutil.rmtree(output_dir)
