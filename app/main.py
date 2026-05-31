@@ -85,7 +85,14 @@ app.add_middleware(
 
 # Define and mount static watch directory for streaming media
 watch_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "watch"))
-os.makedirs(watch_dir, exist_ok=True)
+try:
+    os.makedirs(watch_dir, exist_ok=True)
+except OSError:
+    # Fallback to system temp directory (e.g., /tmp on Vercel serverless read-only filesystems)
+    import tempfile
+    watch_dir = os.path.join(tempfile.gettempdir(), "moviematch_watch")
+    os.makedirs(watch_dir, exist_ok=True)
+
 app.mount("/watch", StaticFiles(directory=watch_dir), name="watch")
 
 
