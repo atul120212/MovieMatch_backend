@@ -14,16 +14,22 @@ GET  /api/rooms/{code}/matches     → computed match results
 WS   /ws/{code}/{user_id}          → real-time room channel
 """
 
+import asyncio
 import json
 import os
 import random
 import string
-from datetime import datetime
+import shutil
+import subprocess
+import threading
+import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session as DBSession
 
 from .database import (
@@ -33,6 +39,8 @@ from .database import (
     SessionMember,
     User,
     Vote,
+    Movie,
+    WatchRoom,
     get_db,
     init_db,
     SessionLocal,
@@ -53,6 +61,8 @@ from .schemas import (
     HealthResponse,
     MemberOut,
     UpdateGenresRequest,
+    MovieUploadResponse,
+    WatchRoomStatusResponse,
 )
 
 load_dotenv(override=True)
@@ -77,6 +87,8 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    t = threading.Thread(target=cleanup_expired_movies_loop, daemon=True)
+    t.start()
 
 
 # ── Room code generator ───────────────────────────────────────────────────────
@@ -118,6 +130,16 @@ class ConnectionManager:
                 await conn["ws"].send_json(data)
             except Exception:
                 pass
+
+    async def send_to_user(self, code: str, user_id: str, data: Dict[str, Any]) -> bool:
+        for conn in self._rooms.get(code, []):
+            if conn["user_id"] == user_id:
+                try:
+                    await conn["ws"].send_json(data)
+                    return True
+                except Exception:
+                    pass
+        return False
 
 
 manager = ConnectionManager()
@@ -291,10 +313,7 @@ def join_room(
     session = db.query(Session).filter(Session.room_code == code.upper()).first()
     if not session:
         raise HTTPException(status_code=404, detail="Room not found")
-    if session.state != "waiting":
-        raise HTTPException(
-            status_code=400, detail="Session already started — cannot join now."
-        )
+
 
     # Create guest user
     user = User(display_name=body.name)
@@ -710,6 +729,33 @@ async def ws_endpoint(
                 payload = json.loads(raw)
                 if payload.get("type") == "ping":
                     await ws.send_json({"type": "pong"})
+                    continue
+                
+                event_type = payload.get("event")
+                if event_type:
+                    # Update database playback states on sync actions
+                    if event_type in ("video_play", "video_pause", "video_seek", "video_heartbeat"):
+                        with SessionLocal() as db:
+                            session = db.query(Session).filter(Session.room_code == code_upper).first()
+                            if session and session.watch_room:
+                                wr = session.watch_room
+                                if event_type == "video_play":
+                                    wr.state = "playing"
+                                elif event_type == "video_pause":
+                                    wr.state = "paused"
+                                
+                                if "time" in payload:
+                                    wr.position_ms = int(payload["time"] * 1000)
+                                db.commit()
+                    
+                    # Handle WebRTC signaling targeting specific peers
+                    if event_type == "webrtc_signal":
+                        target_id = payload.get("target_id")
+                        if target_id:
+                            await manager.send_to_user(code_upper, target_id, payload)
+                    else:
+                        # General broadcast for all chat, reactions, and sync events
+                        await manager.broadcast(code_upper, payload)
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
@@ -736,3 +782,280 @@ async def ws_endpoint(
                 "participants": participants,
             },
         )
+
+
+# ── Co-Watching Subsystems ───────────────────────────────────────────────────
+
+def asyncio_run(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    if loop.is_running():
+        asyncio.run_coroutine_threadsafe(coro, loop)
+    else:
+        loop.run_until_complete(coro)
+
+
+def transcode_movie(room_code: str, movie_id: str, input_path: str, output_dir: str):
+    db = SessionLocal()
+    movie = db.query(Movie).filter(Movie.id == movie_id).first()
+    if not movie:
+        db.close()
+        return
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        ffmpeg_bin = shutil.which("ffmpeg")
+
+        if not ffmpeg_bin:
+            # Fallback 1: No FFmpeg installed -> Copy MP4 directly
+            print("FFmpeg not found. Falling back to direct MP4 streaming.")
+            dest_path = os.path.join(output_dir, "movie.mp4")
+            shutil.copy2(input_path, dest_path)
+            
+            # Update database
+            movie.stream_url = f"/watch/{movie_id}/movie.mp4"
+            movie.status = "ready"
+            movie.progress = 100
+            db.commit()
+            
+            # Broadcast ready state
+            asyncio_run(manager.broadcast(room_code, {
+                "event": "movie_status",
+                "movie_id": movie_id,
+                "status": "ready",
+                "progress": 100,
+                "stream_url": movie.stream_url
+            }))
+            db.close()
+            # Clean up temp file
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
+            return
+
+        # Attempt 1: Fast HLS Codec Copy
+        print("FFmpeg found. Attempting fast HLS segmenting...")
+        hls_index = os.path.join(output_dir, "index.m3u8")
+        cmd_copy = [
+            ffmpeg_bin, "-y", "-i", input_path,
+            "-codec", "copy",
+            "-hls_time", "10", "-hls_playlist_type", "vod",
+            "-hls_segment_filename", os.path.join(output_dir, "seg%03d.ts"),
+            hls_index
+        ]
+        
+        proc = subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode == 0:
+            print("Fast HLS segmenting successful!")
+            movie.stream_url = f"/watch/{movie_id}/index.m3u8"
+            movie.status = "ready"
+            movie.progress = 100
+            db.commit()
+            
+            asyncio_run(manager.broadcast(room_code, {
+                "event": "movie_status",
+                "movie_id": movie_id,
+                "status": "ready",
+                "progress": 100,
+                "stream_url": movie.stream_url
+            }))
+        else:
+            # Fallback 2: Transcode to HLS
+            print("Fast segmenting failed or incompatible codecs. Transcoding...")
+            cmd_transcode = [
+                ffmpeg_bin, "-y", "-i", input_path,
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "128k",
+                "-hls_time", "6", "-hls_playlist_type", "vod",
+                "-hls_segment_filename", os.path.join(output_dir, "seg%03d.ts"),
+                hls_index
+            ]
+            
+            movie.status = "processing"
+            movie.progress = 10
+            db.commit()
+            
+            asyncio_run(manager.broadcast(room_code, {
+                "event": "movie_status",
+                "movie_id": movie_id,
+                "status": "processing",
+                "progress": 10
+            }))
+            
+            proc = subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode == 0:
+                print("Transcoding successful!")
+                movie.stream_url = f"/watch/{movie_id}/index.m3u8"
+                movie.status = "ready"
+                movie.progress = 100
+                db.commit()
+                
+                asyncio_run(manager.broadcast(room_code, {
+                    "event": "movie_status",
+                    "movie_id": movie_id,
+                    "status": "ready",
+                    "progress": 100,
+                    "stream_url": movie.stream_url
+                }))
+            else:
+                print("Transcoding failed. Falling back to direct MP4 copy.")
+                dest_path = os.path.join(output_dir, "movie.mp4")
+                shutil.copy2(input_path, dest_path)
+                
+                movie.stream_url = f"/watch/{movie_id}/movie.mp4"
+                movie.status = "ready"
+                movie.progress = 100
+                db.commit()
+                
+                asyncio_run(manager.broadcast(room_code, {
+                    "event": "movie_status",
+                    "movie_id": movie_id,
+                    "status": "ready",
+                    "progress": 100,
+                    "stream_url": movie.stream_url
+                }))
+
+    except Exception as e:
+        print(f"Exception during transcode: {e}")
+        movie.status = "error"
+        db.commit()
+        asyncio_run(manager.broadcast(room_code, {
+            "event": "movie_status",
+            "movie_id": movie_id,
+            "status": "error"
+        }))
+    finally:
+        db.close()
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+
+@app.post("/api/rooms/{code}/upload", response_model=MovieUploadResponse)
+async def upload_movie(
+    code: str,
+    title: str = Form(...),
+    host_id: str = Form(...),
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: DBSession = Depends(get_db)
+) -> MovieUploadResponse:
+    code_upper = code.upper()
+    session = db.query(Session).filter(Session.room_code == code_upper).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    # Create movie record
+    movie = Movie(title=title)
+    db.add(movie)
+    db.flush()
+
+    # Create watch room (or update existing)
+    wr = db.query(WatchRoom).filter(WatchRoom.session_id == session.id).first()
+    if not wr:
+        wr = WatchRoom(session_id=session.id, movie_id=movie.id, host_id=host_id, state="paused")
+        db.add(wr)
+    else:
+        wr.movie_id = movie.id
+        wr.host_id = host_id
+        wr.state = "paused"
+        wr.position_ms = 0
+    
+    # Change session state to streaming
+    session.state = "streaming"
+    db.commit()
+
+    # Save temp uploaded file
+    temp_dir = os.path.join(os.path.dirname(__file__), "..", "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_path = os.path.join(temp_dir, f"upload_{movie.id}.mp4")
+    
+    with open(temp_file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Next.js asset directory path (inside frontend/public/watch/{movie_id})
+    output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "public", "watch", movie.id))
+    
+    # Run FFmpeg transcode as a background task
+    background_tasks.add_task(transcode_movie, code_upper, movie.id, temp_file_path, output_dir)
+
+    # Broadcast that the session is now streaming!
+    await manager.broadcast(code_upper, {
+        "event": "state_changed",
+        "state": "streaming",
+        "movie_id": movie.id,
+        "movie_title": title
+    })
+
+    return MovieUploadResponse(
+        movie_id=movie.id,
+        title=title,
+        status=movie.status,
+        progress=movie.progress
+    )
+
+
+@app.get("/api/rooms/{code}/watch_status", response_model=WatchRoomStatusResponse)
+def get_watch_status(code: str, db: DBSession = Depends(get_db)) -> WatchRoomStatusResponse:
+    code_upper = code.upper()
+    session = db.query(Session).filter(Session.room_code == code_upper).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    wr = db.query(WatchRoom).filter(WatchRoom.session_id == session.id).first()
+    if not wr:
+        # Create a default watch room if state is streaming
+        if session.state == "streaming":
+            wr = WatchRoom(session_id=session.id, host_id=session.host_id, state="paused")
+            db.add(wr)
+            db.commit()
+        else:
+            raise HTTPException(status_code=400, detail="Watch Room is not active yet")
+
+    return WatchRoomStatusResponse(
+        room_id=wr.id,
+        state=wr.state,
+        position_ms=wr.position_ms,
+        movie_id=wr.movie_id,
+        movie_title=wr.movie.title if wr.movie else None,
+        stream_url=wr.movie.stream_url if wr.movie else None,
+        transcode_status=wr.movie.status if wr.movie else None,
+        transcode_progress=wr.movie.progress if wr.movie else None
+    )
+
+
+def cleanup_expired_movies():
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    with SessionLocal() as db:
+        expired_movies = db.query(Movie).filter(Movie.created_at < cutoff).all()
+        if not expired_movies:
+            return
+
+        for movie in expired_movies:
+            print(f"Cleaning up expired movie: {movie.title} (ID: {movie.id})")
+            output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "public", "watch", movie.id))
+            if os.path.exists(output_dir):
+                try:
+                    shutil.rmtree(output_dir)
+                    print(f"Deleted directory: {output_dir}")
+                except Exception as e:
+                    print(f"Error deleting directory {output_dir}: {e}")
+            db.delete(movie)
+        db.commit()
+
+
+def cleanup_expired_movies_loop():
+    # Give the app some time to boot before first check
+    time.sleep(10)
+    while True:
+        try:
+            cleanup_expired_movies()
+        except Exception as e:
+            print(f"Error during expired movies cleanup: {e}")
+        time.sleep(3600)  # Check every hour

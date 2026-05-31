@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 class CreateRoomRequest(BaseModel):
     host_name: str = Field(..., min_length=1, max_length=64)
-    group_type: str = Field("friends", pattern="^(couple|family|friends|coworkers)$")
+    group_type: str = Field("friends", pattern="^(couple|family|friends|coworkers|stream)$")
 
 
 class JoinRoomRequest(BaseModel):
@@ -111,3 +111,22 @@ class MatchesResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str = "1.0.0"
+
+
+class MovieUploadResponse(BaseModel):
+    movie_id: str
+    title: str
+    status: str
+    progress: int
+
+
+class WatchRoomStatusResponse(BaseModel):
+    room_id: str
+    state: str
+    position_ms: int
+    movie_id: Optional[str] = None
+    movie_title: Optional[str] = None
+    stream_url: Optional[str] = None
+    transcode_status: Optional[str] = None
+    transcode_progress: Optional[int] = None
+

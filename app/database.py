@@ -115,6 +115,7 @@ class Session(Base):
     matches = relationship(
         "Match", back_populates="session", cascade="all, delete-orphan"
     )
+    watch_room = relationship("WatchRoom", back_populates="session", uselist=False, cascade="all, delete-orphan")
 
 
 # ── 3. session_members ──────────────────────────────────────────────────────
@@ -192,6 +193,43 @@ class Match(Base):
     matched_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("Session", back_populates="matches")
+
+# ── 7. movies ──────────────────────────────────────────────────────────────
+class Movie(Base):
+    """
+    An uploaded movie file, transcoded or direct streamed.
+    """
+    __tablename__ = "movies"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String, nullable=False)
+    stream_url = Column(String, nullable=True)  # relative URL, e.g. /watch/{session_id}/index.m3u8 or raw MP4
+    status = Column(String, default="uploading")  # uploading | processing | ready | error
+    progress = Column(Integer, default=0)  # transcode progress %
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    watch_rooms = relationship("WatchRoom", back_populates="movie", cascade="all, delete-orphan")
+
+
+# ── 8. watch_rooms ──────────────────────────────────────────────────────────
+class WatchRoom(Base):
+    """
+    Tracks the active co-watching state of a room.
+    """
+    __tablename__ = "watch_rooms"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("sessions.id"), nullable=False)
+    movie_id = Column(String, ForeignKey("movies.id"), nullable=True)
+    state = Column(String, default="paused")  # playing | paused
+    position_ms = Column(Integer, default=0)  # active seek offset
+    host_id = Column(String, ForeignKey("users.id"), nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    session = relationship("Session", back_populates="watch_room")
+    movie = relationship("Movie", back_populates="watch_rooms")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
