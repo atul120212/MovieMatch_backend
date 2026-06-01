@@ -1086,6 +1086,37 @@ def get_watch_status(code: str, db: DBSession = Depends(get_db)) -> WatchRoomSta
     )
 
 
+@app.post("/api/rooms/{code}/sync")
+async def update_watch_status_http(
+    code: str,
+    state: str = Form(...),
+    position_ms: int = Form(...),
+    db: DBSession = Depends(get_db)
+):
+    code_upper = code.upper()
+    session = db.query(Session).filter(Session.room_code == code_upper).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Room not found")
+        
+    wr = db.query(WatchRoom).filter(WatchRoom.session_id == session.id).first()
+    if not wr:
+        raise HTTPException(status_code=400, detail="Watch room not active")
+        
+    wr.state = state
+    wr.position_ms = position_ms
+    db.commit()
+    
+    # Broadcast to any active websockets just in case some clients are connected via WS
+    event_name = "video_play" if state == "playing" else ("video_pause" if state == "paused" else "video_seek")
+    await manager.broadcast(code_upper, {
+        "event": event_name,
+        "time": position_ms / 1000.0
+    })
+    
+    return {"status": "ok"}
+
+
+
 def cleanup_expired_movies():
     cutoff = datetime.utcnow() - timedelta(hours=24)
     with SessionLocal() as db:
