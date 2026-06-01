@@ -949,6 +949,50 @@ def transcode_movie(room_code: str, movie_id: str, input_path: str, output_dir: 
             pass
 
 
+@app.post("/api/rooms/{code}/stream_url")
+async def start_stream_url(
+    code: str,
+    title: str = Form(...),
+    host_id: str = Form(...),
+    stream_url: str = Form(...),
+    db: DBSession = Depends(get_db)
+):
+    code_upper = code.upper()
+    session = db.query(Session).filter(Session.room_code == code_upper).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    # Create movie record with status = ready since it is directly streamable
+    movie = Movie(title=title, stream_url=stream_url, status="ready", progress=100)
+    db.add(movie)
+    db.flush()
+
+    # Create watch room (or update existing)
+    wr = db.query(WatchRoom).filter(WatchRoom.session_id == session.id).first()
+    if not wr:
+        wr = WatchRoom(session_id=session.id, movie_id=movie.id, host_id=host_id, state="paused")
+        db.add(wr)
+    else:
+        wr.movie_id = movie.id
+        wr.host_id = host_id
+        wr.state = "paused"
+        wr.position_ms = 0
+    
+    # Change session state to streaming
+    session.state = "streaming"
+    db.commit()
+
+    # Broadcast that the session is now streaming!
+    await manager.broadcast(code_upper, {
+        "event": "state_changed",
+        "state": "streaming",
+        "movie_id": movie.id,
+        "movie_title": title
+    })
+
+    return {"status": "ok", "movie_id": movie.id}
+
+
 @app.post("/api/rooms/{code}/upload", response_model=MovieUploadResponse)
 async def upload_movie(
     code: str,
